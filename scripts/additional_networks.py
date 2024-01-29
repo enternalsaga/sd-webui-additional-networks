@@ -585,8 +585,10 @@ def on_infotext_pasted(infotext, params):
     for i in range(MAX_MODEL_COUNT):
         # Convert combined weight into new format
         if f"AddNet Weight {i+1}" in params:
-            params[f"AddNet Weight A {i+1}"] = params[f"AddNet Weight {i+1}"]
-            params[f"AddNet Weight B {i+1}"] = params[f"AddNet Weight {i+1}"]
+            if f"AddNet Weight A {i+1}" not in params:
+                params[f"AddNet Weight A {i+1}"] = params[f"AddNet Weight {i+1}"]
+            if f"AddNet Weight B {i+1}" not in params:
+                params[f"AddNet Weight B {i+1}"] = params[f"AddNet Weight {i+1}"]
 
         if f"AddNet Module {i+1}" not in params:
             params[f"AddNet Module {i+1}"] = "LoRA"
@@ -597,10 +599,10 @@ def on_infotext_pasted(infotext, params):
         if f"AddNet Weight B {i+1}" not in params:
             params[f"AddNet Weight B {i+1}"] = "0"
 
-        params[f"AddNet Weight {i+1}"] = params[f"AddNet Weight A {i+1}"]
-
         if params[f"AddNet Weight A {i+1}"] != params[f"AddNet Weight B {i+1}"]:
             params["AddNet Separate Weights"] = "True"
+        else:
+            params[f"AddNet Weight {i+1}"] = params[f"AddNet Weight A {i+1}"]
 
         # Convert potential legacy name/hash to new format
         params[f"AddNet Model {i+1}"] = str(model_util.find_closest_lora_model_name(params[f"AddNet Model {i+1}"]))
