@@ -6,37 +6,33 @@
 import copy
 import math
 import re
-from typing import NamedTuple
+from typing import Dict, List, NamedTuple
 import torch
 
 
 class LoRAInfo(NamedTuple):
     lora_name: str
     module_name: str
-    module: torch.nn.Module
+    org_module: torch.nn.Module
     multiplier: float
     dim: int
     alpha: float
+    first_lora_in_text_encoder: bool
 
 
 class LoRAModule(torch.nn.Module):
-    """
-    replaces forward method of the original Linear, instead of replacing the original Linear module.
-    """
-
-    def __init__(self, lora_name, org_module: torch.nn.Module, multiplier=1.0, lora_dim=4, alpha=1):
+    # this module doesn't call original module's forward
+    def __init__(self, lora_name, org_module, multiplier=1.0, lora_dim=4, alpha=1, is_mha=False, module_name=None):
         """if alpha == 0 or None, alpha is rank (no scaling)."""
         super().__init__()
         self.lora_name = lora_name
         self.lora_dim = lora_dim
+        self.is_mha = is_mha
+        self.module_name = module_name
 
         if org_module.__class__.__name__ == "Conv2d":
             in_dim = org_module.in_channels
             out_dim = org_module.out_channels
-
-            # self.lora_dim = min(self.lora_dim, in_dim, out_dim)
-            # if self.lora_dim != lora_dim:
-            #   print(f"{lora_name} dim (rank) is changed to: {self.lora_dim}")
 
             kernel_size = org_module.kernel_size
             stride = org_module.stride
@@ -60,120 +56,369 @@ class LoRAModule(torch.nn.Module):
         torch.nn.init.zeros_(self.lora_up.weight)
 
         self.multiplier = multiplier
-        self.org_forward = org_module.forward
-        self.org_module = org_module  # remove in applying
-        self.mask_dic = None
-        self.mask = None
-        self.mask_area = -1
 
-    def apply_to(self):
-        self.org_forward = self.org_module.forward
-        self.org_module.forward = self.forward
-        del self.org_module
+    def set_weights(self, up_weight, down_weight):
+        if self.lora_up.weight.size() != up_weight.size():
+            if len(up_weight.size()) == 4:
+                up_weight = up_weight.squeeze(3).squeeze(2)
+            else:
+                up_weight = up_weight.unsqueeze(2).unsqueeze(3)
+        self.lora_up.weight.data = up_weight
 
-    def set_mask_dic(self, mask_dic):
-        # called before every generation
-
-        # check this module is related to h,w (not context and time emb)
-        if "attn2_to_k" in self.lora_name or "attn2_to_v" in self.lora_name or "emb_layers" in self.lora_name:
-            # print(f"LoRA for context or time emb: {self.lora_name}")
-            self.mask_dic = None
-        else:
-            self.mask_dic = mask_dic
-
-        self.mask = None
+        if self.lora_down.weight.size() != down_weight.size():
+            if len(down_weight.size()) == 4:
+                down_weight = down_weight.squeeze(3).squeeze(2)
+            else:
+                down_weight = down_weight.unsqueeze(2).unsqueeze(3)
+        self.lora_down.weight.data = down_weight
 
     def forward(self, x):
-        """
-        may be cascaded.
-        """
+        return self.lora_up(self.lora_down(x)) * (self.multiplier * self.scale)
+
+
+class LoRAChainContainer:
+    """
+    Container for LoRAChain. Holds global information such as mask, batch size, current step, etc.
+    """
+
+    def __init__(self, will_be_merged=False):
+        self.loras_chains: Dict[str, LoRAChain] = {}
+        self.mask_dic: List[Dict[int, torch.Tensor]] = None
+        self.mask_enabled = False
+        self.will_be_merged = will_be_merged
+
+    def add_chain(self, first_in_text_encoder, lora_name: str, is_text_encoder: bool, module: torch.nn.Module):
+        lora_chain = LoRAChain(self, first_in_text_encoder, lora_name, module, is_text_encoder, self.will_be_merged)
+        self.loras_chains[lora_name] = lora_chain
+
+    def get_module(self, lora_name: str):
+        return self.loras_chains[lora_name].module
+
+    def get_lora_chain(self, lora_name: str):
+        return self.loras_chains[lora_name]
+
+    def prepare_generation(self, num_sub_prompts: int):
+        self.batch_size = 0  # not set yet
+        self.num_sub_prompts = num_sub_prompts  # split by " AND "
+        self.text_encoder_sub_prompt_index = -1  # increment in first lora in text encoder
+
+    def new_step_started(self, batch_size, num_sub_prompts):
+        self.batch_size = batch_size
+        self.num_sub_prompts = num_sub_prompts
+        self.text_encoder_sub_prompt_index = -1
+
+    def set_cond_uncond(self, cond_uncond):
+        self.cond_uncond = cond_uncond
+
+    def clear_mask(self):
+        self.mask_dic = None
+        self.mask_enabled = False
+
+    def set_mask(self, index: int, mask: torch.Tensor, height: int, width: int):
+        self.mask_enabled = True
+
         if self.mask_dic is None:
-            return self.org_forward(x) + self.lora_up(self.lora_down(x)) * self.multiplier * self.scale
+            self.mask_dic = []
+        while len(self.mask_dic) <= index:
+            self.mask_dic.append(None)
+        self.mask_dic[index] = {}
 
-        # regional LoRA
+        curr_mask_dic = self.mask_dic[index]
 
-        # calculate lora and get size
-        lx = self.lora_up(self.lora_down(x))
+        org_dtype = mask.dtype
+        if mask.dtype == torch.bfloat16:
+            mask = mask.to(torch.float)
 
-        if len(lx.size()) == 4:  # b,c,h,w
-            area = lx.size()[2] * lx.size()[3]
+        # create masks
+        mask = mask.unsqueeze(0).unsqueeze(1)  # b(1),c(1),h,w
+
+        def resize_add(mh, mw):
+            # print(mh, mw, mh * mw)
+            m = torch.nn.functional.interpolate(mask, (mh, mw), mode="bilinear")  # doesn't work in bf16
+            m = m.to(dtype=org_dtype)
+            curr_mask_dic[(mh, mw)] = m
+            curr_mask_dic[mh * mw] = torch.reshape(m, (1, -1, 1))
+
+        h = height // 8
+        w = width // 8
+        for _ in range(4):
+            resize_add(h, w)
+            if h % 2 == 1 or w % 2 == 1:  # add extra shape if h/w is not divisible by 2
+                resize_add(h + h % 2, w + w % 2)
+            h = (h + 1) // 2
+            w = (w + 1) // 2
+
+    def get_mask(self, index, size):
+        if self.mask_dic is None or self.mask_dic[index] is None:
+            return None
+        if len(size) == 4:
+            size = size[2:4]
         else:
-            area = lx.size()[1]  # b,seq,dim
-
-        if self.mask is None or self.mask_area != area:
-            # get mask
-            # print(self.lora_name, x.size(), lx.size(), area)
-            mask = self.mask_dic[area]
-            if len(lx.size()) == 3:
-                mask = torch.reshape(mask, (1, -1, 1))
-            self.mask = mask
-            self.mask_area = area
-
-        return self.org_forward(x) + lx * self.multiplier * self.scale * self.mask
+            size = size[1]
+        return self.mask_dic[index].get(size, None)
 
 
-def create_network_and_apply_compvis(du_state_dict, multiplier_tenc, multiplier_unet, text_encoder, unet, **kwargs):
-    # get device and dtype from unet
-    for module in unet.modules():
-        if module.__class__.__name__ == "Linear":
-            param: torch.nn.Parameter = module.weight
-            # device = param.device
-            dtype = param.dtype
-            break
+class LoRAChain:
+    """
+    LoRAChain is a chain of LoRAModules for the single Linear/Conv2d module.
+    Call each LoRAModule in the chain in order with applying mask (regional) or for each sub-prompt (text encoder or not regional).
+    """
 
-    # get dims (rank) and alpha from state dict
-    modules_dim = {}
-    modules_alpha = {}
-    for key, value in du_state_dict.items():
-        if "." not in key:
-            continue
+    def __init__(
+        self,
+        container: LoRAChainContainer,
+        first_in_text_encoder: bool,
+        lora_name: str,
+        module: torch.nn.Module,
+        is_text_encoder,
+        will_be_merged=False,
+    ):
+        self.container = container
+        self.first_lora_in_text_encoder = first_in_text_encoder  # increment sub prompt index if true
+        self.lora_name = lora_name
+        self.module = module
+        self.is_text_encoder = is_text_encoder
+        self.loras: List[LoRAModule] = []
 
-        lora_name = key.split(".")[0]
-        if "alpha" in key:
-            modules_alpha[lora_name] = float(value.detach().to(torch.float).cpu().numpy())
-        elif "lora_down" in key:
-            dim = value.size()[0]
-            modules_dim[lora_name] = dim
+        if not will_be_merged:
+            self.org_forward = module.forward
+            module.forward = self.forward
 
-    # support old LoRA without alpha
-    for key in modules_dim.keys():
-        if key not in modules_alpha:
-            modules_alpha[key] = modules_dim[key]
+        # check regional or not by lora_name
+        if self.is_text_encoder:
+            self.regional = False
+            self.use_sub_prompt = True
+        elif "attn2_to_k" in lora_name or "attn2_to_v" in lora_name:
+            self.regional = False
+            self.use_sub_prompt = True
+        elif "time_emb" in lora_name:
+            self.regional = False
+            self.use_sub_prompt = False
+        else:
+            self.regional = True
+            self.use_sub_prompt = False
 
-    print(
-        f"dimension: {set(modules_dim.values())}, alpha: {set(modules_alpha.values())}, multiplier_unet: {multiplier_unet}, multiplier_tenc: {multiplier_tenc}"
-    )
+    def add_lora(self, index, lora: LoRAModule):
+        while len(self.loras) <= index:
+            self.loras.append(None)
+        self.loras[index] = lora
 
-    # if network_dim is None:
-    #   print(f"The selected model is not LoRA or not trained by `sd-scripts`?")
-    #   network_dim = 4
-    #   network_alpha = 1
+    def default_forward_with_lora(self, x):
+        # call loras without mask
+        ox = self.org_forward(x)
+        for lora in self.loras:
+            if lora is not None:
+                ox += lora(x)
+        return ox
 
-    # create, apply and load weights
-    network = LoRANetworkCompvis(text_encoder, unet, multiplier_tenc, multiplier_unet, modules_dim, modules_alpha)
-    state_dict = network.apply_lora_modules(du_state_dict)  # some weights are applied to text encoder
-    network.to(dtype)  # with this, if error comes from next line, the model will be used
-    info = network.load_state_dict(state_dict, strict=False)
+    def forward(self, x):
+        if not self.container.mask_enabled:
+            return self.default_forward_with_lora(x)
 
-    # remove redundant warnings
-    if len(info.missing_keys) > 4:
-        missing_keys = []
-        alpha_count = 0
-        for key in info.missing_keys:
-            if "alpha" not in key:
-                missing_keys.append(key)
-            else:
-                if alpha_count == 0:
-                    missing_keys.append(key)
-                alpha_count += 1
-        if alpha_count > 1:
-            missing_keys.append(
-                f"... and {alpha_count-1} alphas. The model doesn't have alpha, use dim (rannk) as alpha. You can ignore this message."
+        # increment sub_prompt_index when text encoder is called
+        if self.first_lora_in_text_encoder:
+            # print(
+            #     "first lora in text encoder", self.container.text_encoder_sub_prompt_index, self.container.num_sub_prompts, x.size()
+            # )
+            self.container.text_encoder_sub_prompt_index += 1
+
+        if not self.regional and not self.use_sub_prompt:
+            return self.default_forward_with_lora(x)
+        if self.regional:
+            return self.regional_forward(x)
+        if self.is_text_encoder:
+            return self.text_encoder_forward(x)
+        return self.sub_prompt_forward(x)
+
+    def text_encoder_forward(self, x):
+        # x is for single lora
+
+        # if no subprompt, apply LoRA to all (cond and uncond)
+        if self.container.num_sub_prompts <= 1:
+            return self.default_forward_with_lora(x)
+
+        # if uncond in text_encoder, do not apply LoRA
+        if x.size()[0] == self.container.batch_size:
+            return self.org_forward(x)
+
+        # if no LoRA for this subprompt, do not apply LoRA
+        if self.container.text_encoder_sub_prompt_index >= len(self.loras):
+            return self.org_forward(x)
+        if self.container.text_encoder_sub_prompt_index < 0:
+            # in case of no LoRA for text encoder, sub_prompt_index is not incremented
+            return self.org_forward(x)
+
+        lora = self.loras[self.container.text_encoder_sub_prompt_index]
+        if lora is None:
+            return self.org_forward(x)
+
+        return self.org_forward(x) + lora(x)
+
+    def sub_prompt_forward(self, x):
+        assert not self.is_text_encoder and (
+            "attn2_to_k" in self.lora_name or "attn2_to_v" in self.lora_name,
+            "sub_prompt_forward is called for attn2_to_k/v",
+        )
+
+        # doesn't use x
+        cond_uncond = self.container.cond_uncond
+        # print(
+        #     "attn2_to_k_v_forward called",
+        #     self.lora_name,
+        #     cond_uncond.size(),
+        #     self.container.num_sub_prompts,
+        #     self.container.batch_size,
+        # )
+
+        ox = self.org_forward(cond_uncond)
+
+        lx = torch.zeros_like(ox)
+        for i, lora in enumerate(self.loras):
+            if lora is not None:
+                emb_idx = i
+                cond = cond_uncond[emb_idx :: self.container.num_sub_prompts]
+                lx1 = lora(cond)
+                lx[emb_idx :: self.container.num_sub_prompts] = lx1
+
+        return ox + lx
+
+    def regional_forward(self, x):
+        if "attn2_to_out" in self.lora_name:
+            return self.to_out_forward(x)
+
+        ox = self.org_forward(x)
+
+        for i, lora in enumerate(self.loras):
+            if lora is not None:
+                lx = lora(x)
+
+                mask = self.container.get_mask(i, lx.size())
+                if mask is not None:
+                    lx = lx * mask
+
+                ox = ox + lx
+
+        x = ox
+        if "attn2_to_q" in self.lora_name:
+            x = self.postp_to_q(x)
+        return x
+
+    def postp_to_q(self, x):
+        # if to_q, repeat x to same number of the cond and uncond (num_sub_prompts+1)
+        # x: b1c, b2c, ... , b1uc, b2uc
+        query = []
+        for i in range(self.container.batch_size):
+            for _ in range(self.container.num_sub_prompts):
+                query.append(x[i])
+
+        for i in range(self.container.batch_size):
+            query.append(x[self.container.batch_size + i])
+
+        x = torch.stack(query)
+        # print("to_q postp", x.size())
+
+        # now x has subprompts and uncond, same as U-Net modules:
+        # x: b1s1, b1s2, b1s3, b2s1, b2s2, b2s3, ..., b1u1, b2u1, ...
+
+        return x
+
+    def to_out_forward(self, x):
+        ox = self.org_forward(x)
+        lx = torch.zeros_like(ox)
+
+        # apply this LoRA
+        masks = []
+        for i, lora in enumerate(self.loras):
+            mask = None
+            if lora is not None:
+                if i < self.container.num_sub_prompts:
+                    # apply to  single subprompt
+                    emb_idx = i
+                    lx1 = lora(x[emb_idx :: self.container.num_sub_prompts])
+
+                    mask = self.container.get_mask(i, lx1.size())
+                    if mask is not None:
+                        lx1 = lx1 * mask
+                    else:
+                        mask = torch.ones((1, *lx1.size()[1:-1], 1), dtype=lx1.dtype, device=lx1.device)
+                    masks.append(mask)
+
+                    lx[emb_idx :: self.container.num_sub_prompts] = lx1
+                else:
+                    # apply to all subprompts
+                    lx1 = lora(x)
+                    lx = lx + lx1
+        x = ox
+
+        # mask weighted sum
+        mask = torch.cat(masks, dim=0)  # (num_sub_prompts, ...)
+
+        # print("to_out", mask.size(), x.size(), lx.size())
+
+        # if num of masks is more than num_sub_prompts, modify mask
+        # for example, if num of masks is 3, and num_sub_prompts is 2, then third mask is applied to all subprompts.
+        # it means that third mask is added to first and second mask.
+        # because 1st and 2nd mask will be applied to each subprompt.
+        num_extra_masks = len(masks) - self.container.num_sub_prompts
+        if num_extra_masks > 0:
+            # if there are 5 masks, and num_sub_prompts is 3, then weight1 is 1/5.
+            weight1 = 1 / len(masks)
+
+            mask[: self.container.num_sub_prompts] *= weight1 * self.container.num_sub_prompts  # 1/5 * 3 = 3/5
+
+            for i in range(num_extra_masks):
+                mask[: self.container.num_sub_prompts] += mask[self.container.num_sub_prompts + i] * weight1  # 1/5
+
+            # total weight is 1.0. however I'm not sure if it is correct (;'∀')
+
+            mask = mask[: self.container.num_sub_prompts]
+
+        # if num of masks is less than num_sub_prompts, it means num of loras is less than num_sub_prompts
+        # in this case, extra subprompts are not applied to any lora.
+        # however, x_cond should be calculated from all subprompts, so we need to add extra masks.
+        if len(masks) < self.container.num_sub_prompts:
+            mask = torch.cat(
+                [
+                    mask,
+                    torch.ones(
+                        (self.container.num_sub_prompts - len(masks), *mask.size()[1:]), dtype=mask.dtype, device=mask.device
+                    ),
+                ],
+                dim=0,
             )
 
-        info = torch.nn.modules.module._IncompatibleKeys(missing_keys, info.unexpected_keys)
+        mask_sum = torch.sum(mask, dim=0) + 1e-4
 
-    return network, info
+        out = []
+        for i in range(0, self.container.num_sub_prompts * self.container.batch_size, self.container.num_sub_prompts):
+            emb_idx = i
+            num_loras = len(self.loras)  # == num of masks, may be less than num_sub_prompts
+
+            x_cond = x[emb_idx : emb_idx + self.container.num_sub_prompts]
+            lx1 = lx[emb_idx : emb_idx + num_loras]
+
+            # print("x_cond", x_cond.size(), "lx1", lx1.size(), "mask", mask.size())
+            x_cond = x_cond * mask / mask_sum
+            x_cond = torch.sum(x_cond, dim=0)
+
+            x_cond = x_cond + torch.sum(lx1, dim=0)
+            out.append(x_cond)
+
+        for i in range(self.container.batch_size):
+            x_uncond = x[self.container.num_sub_prompts * self.container.batch_size + i]
+            # x_uncond = x_uncond + lx[self.container.num_sub_prompts * self.container.batch_size + i]
+            out.append(x_uncond)
+
+        x = torch.stack(out)
+        # print("to_out finished", x.size())
+        return x
+
+
+def create_network(du_state_dict, multiplier_tenc, multiplier_unet, text_encoder, unet, device, dtype, **kwargs):
+    network = LoRANetworkCompvis(text_encoder, unet, multiplier_tenc, multiplier_unet)
+    network.application_info = (du_state_dict, device, dtype)
+    network.weights_mergeable = True  # always True if no mask currently
+    return network
 
 
 class LoRANetworkCompvis(torch.nn.Module):
@@ -286,18 +531,14 @@ class LoRANetworkCompvis(torch.nn.Module):
                 cv_index = du_block_index
                 if v2:
                     if "mlp_fc1" in du_suffix:
-                        cv_name = (
-                            f"lora_te_wrapped_model_transformer_resblocks_{cv_index}_{du_suffix.replace('mlp_fc1', 'mlp_c_fc')}"
-                        )
+                        cv_name = f"lora_te_model_transformer_resblocks_{cv_index}_{du_suffix.replace('mlp_fc1', 'mlp_c_fc')}"
                     elif "mlp_fc2" in du_suffix:
-                        cv_name = (
-                            f"lora_te_wrapped_model_transformer_resblocks_{cv_index}_{du_suffix.replace('mlp_fc2', 'mlp_c_proj')}"
-                        )
+                        cv_name = f"lora_te_model_transformer_resblocks_{cv_index}_{du_suffix.replace('mlp_fc2', 'mlp_c_proj')}"
                     elif "self_attn":
                         # handled later
-                        cv_name = f"lora_te_wrapped_model_transformer_resblocks_{cv_index}_{du_suffix.replace('self_attn', 'attn')}"
+                        cv_name = f"lora_te_model_transformer_resblocks_{cv_index}_{du_suffix.replace('self_attn', 'attn')}"
                 else:
-                    cv_name = f"lora_te_wrapped_transformer_text_model_encoder_layers_{cv_index}_{du_suffix}"
+                    cv_name = f"lora_te_transformer_text_model_encoder_layers_{cv_index}_{du_suffix}"
 
         assert cv_name is not None, f"conversion failed: {du_name}. the model may not be trained by `sd-scripts`."
         return cv_name
@@ -312,16 +553,21 @@ class LoRANetworkCompvis(torch.nn.Module):
             tokens = key.split(".")
             compvis_name = LoRANetworkCompvis.convert_diffusers_name_to_compvis(v2, tokens[0])
             new_key = compvis_name + "." + ".".join(tokens[1:])
-
             new_sd[new_key] = value
 
         return new_sd
 
-    def __init__(self, text_encoder, unet, multiplier_tenc=1.0, multiplier_unet=1.0, modules_dim=None, modules_alpha=None) -> None:
+    def __init__(
+        self,
+        text_encoder,
+        unet,
+        multiplier_tenc=1.0,
+        multiplier_unet=1.0,
+    ) -> None:
         super().__init__()
         self.multiplier_unet = multiplier_unet
         self.multiplier_tenc = multiplier_tenc
-        self.latest_mask_info = None
+        self.support_mask = True
 
         # check v1 or v2
         self.v2 = False
@@ -332,88 +578,6 @@ class LoRANetworkCompvis(torch.nn.Module):
                     break
             if self.v2:
                 break
-
-        # convert lora name to CompVis and get dim and alpha
-        comp_vis_loras_dim_alpha = {}
-        for du_lora_name in modules_dim.keys():
-            dim = modules_dim[du_lora_name]
-            alpha = modules_alpha[du_lora_name]
-            comp_vis_lora_name = LoRANetworkCompvis.convert_diffusers_name_to_compvis(self.v2, du_lora_name)
-            comp_vis_loras_dim_alpha[comp_vis_lora_name] = (dim, alpha)
-
-        # create module instances
-        def create_modules(prefix, root_module: torch.nn.Module, target_replace_modules, multiplier):
-            loras = []
-            replaced_modules = []
-            for name, module in root_module.named_modules():
-                if module.__class__.__name__ in target_replace_modules:
-                    for child_name, child_module in module.named_modules():
-                        # enumerate all Linear and Conv2d
-                        if child_module.__class__.__name__ == "Linear" or child_module.__class__.__name__ == "Conv2d":
-                            lora_name = prefix + "." + name + "." + child_name
-                            lora_name = lora_name.replace(".", "_")
-                            if "_resblocks_23_" in lora_name:  # ignore last block in StabilityAi Text Encoder
-                                break
-                            if lora_name not in comp_vis_loras_dim_alpha:
-                                continue
-
-                            dim, alpha = comp_vis_loras_dim_alpha[lora_name]
-                            lora = LoRAModule(lora_name, child_module, multiplier, dim, alpha)
-                            loras.append(lora)
-
-                            replaced_modules.append(child_module)
-                        elif child_module.__class__.__name__ == "MultiheadAttention":
-                            # make four modules: not replacing forward method but merge weights later
-                            for suffix in ["q_proj", "k_proj", "v_proj", "out_proj"]:
-                                module_name = prefix + "." + name + "." + child_name  # ~.attn
-                                module_name = module_name.replace(".", "_")
-                                if "_resblocks_23_" in module_name:  # ignore last block in StabilityAi Text Encoder
-                                    break
-
-                                lora_name = module_name + "_" + suffix
-                                if lora_name not in comp_vis_loras_dim_alpha:
-                                    continue
-                                dim, alpha = comp_vis_loras_dim_alpha[lora_name]
-                                lora_info = LoRAInfo(lora_name, module_name, child_module, multiplier, dim, alpha)
-                                loras.append(lora_info)
-
-                                replaced_modules.append(child_module)
-            return loras, replaced_modules
-
-        self.text_encoder_loras, te_rep_modules = create_modules(
-            LoRANetworkCompvis.LORA_PREFIX_TEXT_ENCODER,
-            text_encoder,
-            LoRANetworkCompvis.TEXT_ENCODER_TARGET_REPLACE_MODULE,
-            self.multiplier_tenc,
-        )
-        print(f"create LoRA for Text Encoder: {len(self.text_encoder_loras)} modules.")
-
-        self.unet_loras, unet_rep_modules = create_modules(
-            LoRANetworkCompvis.LORA_PREFIX_UNET, unet, LoRANetworkCompvis.UNET_TARGET_REPLACE_MODULE, self.multiplier_unet
-        )
-        print(f"create LoRA for U-Net: {len(self.unet_loras)} modules.")
-
-        # make backup of original forward/weights, if multiple modules are applied, do in 1st module only
-        backed_up = False  # messaging purpose only
-        for rep_module in te_rep_modules + unet_rep_modules:
-            if (
-                rep_module.__class__.__name__ == "MultiheadAttention"
-            ):  # multiple MHA modules are in list, prevent to backed up forward
-                if not hasattr(rep_module, "_lora_org_weights"):
-                    # avoid updating of original weights. state_dict is reference to original weights
-                    rep_module._lora_org_weights = copy.deepcopy(rep_module.state_dict())
-                    backed_up = True
-            elif not hasattr(rep_module, "_lora_org_forward"):
-                rep_module._lora_org_forward = rep_module.forward
-                backed_up = True
-        if backed_up:
-            print("original forward/weights is backed up.")
-
-        # assertion
-        names = set()
-        for lora in self.text_encoder_loras + self.unet_loras:
-            assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
-            names.add(lora.lora_name)
 
     def restore(self, text_encoder, unet):
         # restore forward/weights from property for all modules
@@ -426,9 +590,7 @@ class LoRANetworkCompvis(torch.nn.Module):
                 module.forward = module._lora_org_forward
                 del module._lora_org_forward
                 restored = True
-            if hasattr(
-                module, "_lora_org_weights"
-            ):  # module doesn't have forward and weights at same time currently, but supports it for future changing
+            if hasattr(module, "_lora_org_weights"):
                 module.load_state_dict(module._lora_org_weights)
                 del module._lora_org_weights
                 restored = True
@@ -436,199 +598,279 @@ class LoRANetworkCompvis(torch.nn.Module):
         if restored:
             print("original forward/weights is restored.")
 
-    def apply_lora_modules(self, du_state_dict):
-        # conversion 1st step: convert names in state_dict
+    def apply_to_compvis(self, index, text_encoder, unet, merge_weights, shared, **kwargs):
+        du_state_dict, device, dtype = self.application_info
+        del self.application_info  # state_dict is large, so delete it
+
         state_dict = LoRANetworkCompvis.convert_state_dict_name_to_compvis(self.v2, du_state_dict)
 
-        # check state_dict has text_encoder or unet
-        weights_has_text_encoder = weights_has_unet = False
-        for key in state_dict.keys():
-            if key.startswith(LoRANetworkCompvis.LORA_PREFIX_TEXT_ENCODER):
-                weights_has_text_encoder = True
-            elif key.startswith(LoRANetworkCompvis.LORA_PREFIX_UNET):
-                weights_has_unet = True
-            if weights_has_text_encoder and weights_has_unet:
-                break
-
-        apply_text_encoder = weights_has_text_encoder
-        apply_unet = weights_has_unet
-
-        if apply_text_encoder:
-            print("enable LoRA for text encoder")
-        else:
-            self.text_encoder_loras = []
-
-        if apply_unet:
-            print("enable LoRA for U-Net")
-        else:
-            self.unet_loras = []
-
-        # add modules to network: this makes state_dict can be got from LoRANetwork
-        mha_loras = {}
-        for lora in self.text_encoder_loras + self.unet_loras:
-            if type(lora) == LoRAModule:
-                lora.apply_to()  # ensure remove reference to original Linear: reference makes key of state_dict
-                self.add_module(lora.lora_name, lora)
-            else:
-                # SD2.x MultiheadAttention merge weights to MHA weights
-                lora_info: LoRAInfo = lora
-                if lora_info.module_name not in mha_loras:
-                    mha_loras[lora_info.module_name] = {}
-
-                lora_dic = mha_loras[lora_info.module_name]
-                lora_dic[lora_info.lora_name] = lora_info
-                if len(lora_dic) == 4:
-                    # calculate and apply
-                    module = lora_info.module
-                    module_name = lora_info.module_name
-                    w_q_dw = state_dict.get(module_name + "_q_proj.lora_down.weight")
-                    if w_q_dw is not None:  # corresponding LoRA module exists
-                        w_q_up = state_dict[module_name + "_q_proj.lora_up.weight"]
-                        w_k_dw = state_dict[module_name + "_k_proj.lora_down.weight"]
-                        w_k_up = state_dict[module_name + "_k_proj.lora_up.weight"]
-                        w_v_dw = state_dict[module_name + "_v_proj.lora_down.weight"]
-                        w_v_up = state_dict[module_name + "_v_proj.lora_up.weight"]
-                        w_out_dw = state_dict[module_name + "_out_proj.lora_down.weight"]
-                        w_out_up = state_dict[module_name + "_out_proj.lora_up.weight"]
-                        q_lora_info = lora_dic[module_name + "_q_proj"]
-                        k_lora_info = lora_dic[module_name + "_k_proj"]
-                        v_lora_info = lora_dic[module_name + "_v_proj"]
-                        out_lora_info = lora_dic[module_name + "_out_proj"]
-
-                        sd = module.state_dict()
-                        qkv_weight = sd["in_proj_weight"]
-                        out_weight = sd["out_proj.weight"]
-                        dev = qkv_weight.device
-
-                        def merge_weights(l_info, weight, up_weight, down_weight):
-                            # calculate in float
-                            scale = l_info.alpha / l_info.dim
-                            dtype = weight.dtype
-                            weight = (
-                                weight.float()
-                                + l_info.multiplier
-                                * (up_weight.to(dev, dtype=torch.float) @ down_weight.to(dev, dtype=torch.float))
-                                * scale
-                            )
-                            weight = weight.to(dtype)
-                            return weight
-
-                        q_weight, k_weight, v_weight = torch.chunk(qkv_weight, 3)
-                        if q_weight.size()[1] == w_q_up.size()[0]:
-                            q_weight = merge_weights(q_lora_info, q_weight, w_q_up, w_q_dw)
-                            k_weight = merge_weights(k_lora_info, k_weight, w_k_up, w_k_dw)
-                            v_weight = merge_weights(v_lora_info, v_weight, w_v_up, w_v_dw)
-                            qkv_weight = torch.cat([q_weight, k_weight, v_weight])
-
-                            out_weight = merge_weights(out_lora_info, out_weight, w_out_up, w_out_dw)
-
-                            sd["in_proj_weight"] = qkv_weight.to(dev)
-                            sd["out_proj.weight"] = out_weight.to(dev)
-
-                            lora_info.module.load_state_dict(sd)
-                        else:
-                            # different dim, version mismatch
-                            print(f"shape of weight is different: {module_name}. SD version may be different")
-
-                        for t in ["q", "k", "v", "out"]:
-                            del state_dict[f"{module_name}_{t}_proj.lora_down.weight"]
-                            del state_dict[f"{module_name}_{t}_proj.lora_up.weight"]
-                            alpha_key = f"{module_name}_{t}_proj.alpha"
-                            if alpha_key in state_dict:
-                                del state_dict[alpha_key]
-                    else:
-                        # corresponding weight not exists: version mismatch
-                        pass
-
-        # conversion 2nd step: convert weight's shape (and handle wrapped)
-        state_dict = self.convert_state_dict_shape_to_compvis(state_dict)
-
-        return state_dict
-
-    def convert_state_dict_shape_to_compvis(self, state_dict):
-        # shape conversion
-        current_sd = self.state_dict()  # to get target shape
-        wrapped = False
-        count = 0
-        for key in list(state_dict.keys()):
-            if key not in current_sd:
-                continue  # might be error or another version
-            if "wrapped" in key:
-                wrapped = True
-
-            value: torch.Tensor = state_dict[key]
-            if value.size() != current_sd[key].size():
-                # print(f"convert weights shape: {key}, from: {value.size()}, {len(value.size())}")
-                count += 1
-                if len(value.size()) == 4:
-                    value = value.squeeze(3).squeeze(2)
-                else:
-                    value = value.unsqueeze(2).unsqueeze(3)
-                state_dict[key] = value
-            if tuple(value.size()) != tuple(current_sd[key].size()):
-                print(
-                    f"weight's shape is different: {key} expected {current_sd[key].size()} found {value.size()}. SD version may be different"
-                )
-                del state_dict[key]
-        print(f"shapes for {count} weights are converted.")
-
-        # convert wrapped
-        if not wrapped:
-            print("remove 'wrapped' from keys")
-            for key in list(state_dict.keys()):
-                if "_wrapped_" in key:
-                    new_key = key.replace("_wrapped_", "_")
-                    state_dict[new_key] = state_dict[key]
-                    del state_dict[key]
-
-        return state_dict
-
-    def set_mask(self, mask, height=None, width=None, hr_height=None, hr_width=None):
-        if mask is None:
-            # clear latest mask
-            # print("clear mask")
-            self.latest_mask_info = None
-            for lora in self.unet_loras:
-                lora.set_mask_dic(None)
-            return
-
-        # check mask image and h/w are same
-        if (
-            self.latest_mask_info is not None
-            and torch.equal(mask, self.latest_mask_info[0])
-            and (height, width, hr_height, hr_width) == self.latest_mask_info[1:]
-        ):
-            # print("mask not changed")
-            return
-
-        self.latest_mask_info = (mask, height, width, hr_height, hr_width)
-
-        org_dtype = mask.dtype
-        if mask.dtype == torch.bfloat16:
-            mask = mask.to(torch.float)
-
-        mask_dic = {}
-        mask = mask.unsqueeze(0).unsqueeze(1)  # b(1),c(1),h,w
-
-        def resize_add(mh, mw):
-            # print(mh, mw, mh * mw)
-            m = torch.nn.functional.interpolate(mask, (mh, mw), mode="bilinear")  # doesn't work in bf16
-            m = m.to(org_dtype)
-            mask_dic[mh * mw] = m
-
-        for h, w in [(height, width), (hr_height, hr_width)]:
-            if not h or not w:
+        # get dims (rank) and alpha from state dict
+        modules_dim = {}
+        modules_alpha = {}
+        for key, value in state_dict.items():
+            if "." not in key:
                 continue
 
-            h = h // 8
-            w = w // 8
-            for i in range(4):
-                resize_add(h, w)
-                if h % 2 == 1 or w % 2 == 1:  # add extra shape if h/w is not divisible by 2
-                    resize_add(h + h % 2, w + w % 2)
-                h = (h + 1) // 2
-                w = (w + 1) // 2
+            lora_name = key.split(".")[0]
+            if "alpha" in key:
+                modules_alpha[lora_name] = float(value.detach().to(torch.float).cpu().numpy())
+            elif "lora_down" in key:
+                dim = value.size()[0]
+                modules_dim[lora_name] = dim
 
-        for lora in self.unet_loras:
-            lora.set_mask_dic(mask_dic)
-        return
+        # support old LoRA without alpha
+        for key in modules_dim.keys():
+            if key not in modules_alpha:
+                modules_alpha[key] = modules_dim[key]
+
+        print(
+            f"dimension: {set(modules_dim.values())}, alpha: {set(modules_alpha.values())}, multiplier_unet: {self.multiplier_unet}, multiplier_tenc: {self.multiplier_tenc}"
+        )
+
+        # make backup of original forward/weights, if multiple modules are applied, do in 1st module only
+        if "lora_prepared" not in shared:
+            shared["lora_prepared"] = True
+            lora_chains = self.prepare_applying(text_encoder, unet, merge_weights, device)
+            shared["lora_chains"] = lora_chains
+        lora_chains: LoRAChainContainer = shared["lora_chains"]
+
+        if merge_weights:
+            self.merge_weights(state_dict, modules_dim, modules_alpha, lora_chains, device, dtype)
+            self.lora_chains = None
+            return "weights are mereged."
+
+        print("create LoRA modules")
+        self.lora_chains = lora_chains
+        for key in list(state_dict.keys()):
+            if not key.endswith(".lora_up.weight"):
+                continue
+
+            lora_name = key.replace(".lora_up.weight", "")
+
+            up_weight = state_dict[key]
+            down_weight = state_dict.get(lora_name + ".lora_down.weight", None)
+
+            dim, alpha = modules_dim[lora_name], modules_alpha[lora_name]
+
+            if lora_name.startswith(LoRANetworkCompvis.LORA_PREFIX_TEXT_ENCODER):
+                multiplier = self.multiplier_tenc
+            else:
+                multiplier = self.multiplier_unet
+
+            lora_chain = lora_chains.get_lora_chain(lora_name)
+
+            lora = LoRAModule(lora_name, lora_chain.module, multiplier, dim, alpha)
+            lora.set_weights(up_weight, down_weight)
+            lora.to(device, dtype=dtype)
+
+            lora_chain.add_lora(index, lora)
+
+        return f"LoRA modules are applied to {len(modules_dim)} modules."
+
+    def merge_weights(self, state_dict, modules_dim, modules_alpha, lora_chains: LoRAChainContainer, device, dtype):
+        print("merge weights")
+        for key in list(state_dict.keys()):
+            if "lora_up.weight" not in key:
+                continue
+            lora_name = key.replace(".lora_up.weight", "")
+
+            multiplier = self.multiplier_unet if lora_name.startswith(LoRANetworkCompvis.LORA_PREFIX_UNET) else self.multiplier_tenc
+
+            up_weight = state_dict[key]
+            down_weight = state_dict.get(lora_name + ".lora_down.weight", None)
+            up_weight = up_weight.to(device)
+            down_weight = down_weight.to(device)
+
+            dim, alpha = modules_dim[lora_name], modules_alpha[lora_name]
+            scale = alpha / dim * multiplier
+
+            # calculate in float
+            sd = lora_chains.get_module(lora_name).state_dict()
+            weight = sd["weight"]
+            weight = weight.to(torch.float32)
+
+            if len(weight.size()) == 2:
+                # linear
+                if len(down_weight.size()) == 4:
+                    down_weight = down_weight.squeeze(3).squeeze(2)
+                    up_weight = up_weight.squeeze(3).squeeze(2)
+                weight = weight + (up_weight @ down_weight) * scale
+            elif down_weight.size()[2:4] == (1, 1):
+                # conv2d 1x1
+                weight = (
+                    weight + (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3) * scale
+                )
+            else:
+                # conv2d 3x3
+                conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
+                weight = weight + conved * scale
+
+            weight = weight.to(device, dtype=dtype)
+
+            sd["weight"] = weight
+            lora_chains.get_module(lora_name).load_state_dict(sd)
+
+    # backup weights / forwards, replace MultiheadAttention for LoRA, add undecorator
+    def prepare_applying(self, text_encoder, unet, merge_weights, device) -> List[LoRAChain]:
+        mhas = []
+        target_modules = []
+        for name, module in text_encoder.named_modules():
+            if module.__class__.__name__ in LoRANetworkCompvis.TEXT_ENCODER_TARGET_REPLACE_MODULE:
+                for child_name, child_module in module.named_modules():
+                    if child_module.__class__.__name__ == "Linear" or child_module.__class__.__name__ == "Conv2d":
+                        target_modules.append((True, child_module, name + "." + child_name))
+                    if child_module.__class__.__name__ == "MultiheadAttention":
+                        mhas.append((True, child_module, name + "." + child_name))
+        for name, module in unet.named_modules():
+            if module.__class__.__name__ in LoRANetworkCompvis.UNET_TARGET_REPLACE_MODULE:
+                for child_name, child_module in module.named_modules():
+                    if child_module.__class__.__name__ == "Linear" or child_module.__class__.__name__ == "Conv2d":
+                        target_modules.append((False, child_module, name + "." + child_name))
+
+        backed_up_count = 0
+        if merge_weights:
+            # backup weights
+            for _, rep_module, _ in target_modules:  # mhas are not backed up, because their weights are copied to to_q/k/v/out
+                if not hasattr(rep_module, "_lora_org_weights"):
+                    # avoid updating of original weights. state_dict is reference to original weights
+                    rep_module._lora_org_weights = copy.deepcopy(rep_module.state_dict())
+                    backed_up_count += 1
+
+        # backup forward
+        for _, rep_module, _ in mhas + ([] if merge_weights else target_modules):
+            if not hasattr(rep_module, "_lora_org_forward"):
+                rep_module._lora_org_forward = rep_module.forward
+                backed_up_count += 1
+
+        print(f"{backed_up_count} weights/forwards are backed up.")
+
+        print("replacing MultiheadAttention")
+        for _, mha_module, name in mhas:
+            # print(f"replace MultiheadAttention for {name}")
+
+            mha_attn_rep = MultiheadAttentionReplace(mha_module.num_heads, mha_module.embed_dim)
+
+            # load weights and convert to q/k/v/out
+            sd = mha_module.state_dict()
+            qkv_weight = sd["in_proj_weight"]
+            qkv_bias = sd["in_proj_bias"]
+            out_weight = sd["out_proj.weight"]
+            out_bias = sd["out_proj.bias"]
+
+            q_weight, k_weight, v_weight = torch.chunk(qkv_weight, 3)
+            q_bias, k_bias, v_bias = torch.chunk(qkv_bias, 3)
+
+            rep_sd = {
+                "to_q.weight": q_weight,
+                "to_q.bias": q_bias,
+                "to_k.weight": k_weight,
+                "to_k.bias": k_bias,
+                "to_v.weight": v_weight,
+                "to_v.bias": v_bias,
+                "to_out.weight": out_weight,
+                "to_out.bias": out_bias,
+            }
+            mha_attn_rep.load_state_dict(rep_sd)
+            mha_attn_rep.to(device)
+            mha_module.forward = mha_attn_rep.forward
+
+            target_modules.append((True, mha_attn_rep.to_q, name + ".q_proj"))
+            target_modules.append((True, mha_attn_rep.to_k, name + ".k_proj"))
+            target_modules.append((True, mha_attn_rep.to_v, name + ".v_proj"))
+            target_modules.append((True, mha_attn_rep.to_out, name + ".out_proj"))
+
+        lora_chains = LoRAChainContainer(merge_weights)
+        first_in_text_encoder = True
+        for is_text_encoder, module, name in target_modules:
+            prefix = LoRANetworkCompvis.LORA_PREFIX_TEXT_ENCODER if is_text_encoder else LoRANetworkCompvis.LORA_PREFIX_UNET
+
+            name = name.replace("wrapped.", "")  # wrapped is added by Web UI
+            lora_name = prefix + "_" + name.replace(".", "_")
+            lora_chains.add_chain(first_in_text_encoder, lora_name, is_text_encoder, module)
+            first_in_text_encoder = False
+
+        return lora_chains
+
+    def set_mask(self, index, mask, height=None, width=None, **kwargs):
+        if mask is None:
+            # clear latest mask
+            if self.lora_chains is None:
+                return
+            self.lora_chains.clear_mask()
+            return
+
+        self.lora_chains.set_mask(index, mask, height, width)
+
+    def prepare_generation(self, index, num_subprompts, shared, **kwargs):
+        if "lora_proc_prepare_generation" not in shared:
+            shared["lora_proc_prepare_generation"] = True
+            if self.lora_chains is None:
+                return
+            self.lora_chains.prepare_generation(num_subprompts)
+
+    def new_step_started(self, batch_size, num_sub_prompts, shared):
+        if "lora_proc_new_step" not in shared:
+            shared["lora_proc_new_step"] = True
+            if self.lora_chains is None:
+                return
+            self.lora_chains.new_step_started(batch_size, num_sub_prompts)
+
+    def set_cond_uncond(self, cond_uncond, shared):
+        if "lora_proc_set_cond_uncond" not in shared:
+            shared["lora_proc_set_cond_uncond"] = True
+            if self.lora_chains is None:
+                return
+            self.lora_chains.set_cond_uncond(cond_uncond)
+
+
+class MultiheadAttentionReplace(torch.nn.Module):
+    def __init__(self, heads, dim) -> None:
+        super(MultiheadAttentionReplace, self).__init__()
+        self.to_q = torch.nn.Linear(dim, dim)
+        self.to_k = torch.nn.Linear(dim, dim)
+        self.to_v = torch.nn.Linear(dim, dim)
+        self.to_out = torch.nn.Linear(dim, dim)
+        self.num_heads = heads
+        self.embed_dim = dim
+        self.head_dim = dim // heads
+
+    def forward(self, q, k, v, need_weights=False, attn_mask=None):
+        if q is None:
+            return self
+
+        # print("CAR called", self.__class__.__name__, q.size(), q.dtype, "none" if attn_mask is None else attn_mask.size())
+        # in default, batch_first = False
+        batch_size = q.size()[1]
+
+        # Linear transformations for query, key, and value
+        query = self.to_q(q) * (self.head_dim**-0.5)
+        key = self.to_k(k)
+        value = self.to_v(v)
+        del q, k, v
+
+        # Splitting heads
+        query = query.view(-1, batch_size, self.num_heads, self.head_dim).permute(1, 2, 0, 3)
+        key = key.view(-1, batch_size, self.num_heads, self.head_dim).permute(1, 2, 0, 3)
+        value = value.view(-1, batch_size, self.num_heads, self.head_dim).permute(1, 2, 0, 3)
+
+        # Attention scores
+        key = key.transpose(-2, -1)
+        scores = torch.matmul(query, key)
+        del query, key
+        if attn_mask is not None:
+            max_neg_value = -torch.finfo(torch.float16).max  # attn_mask.dtype causes error
+            scores = scores.masked_fill(attn_mask != 0, max_neg_value)  # -5e4)  # 9)
+
+        # Attention weights
+        weights = torch.softmax(scores, dim=-1)
+        del scores
+
+        # Attention output
+        attn_output = torch.matmul(weights, value)
+        del weights, value
+        attn_output = attn_output.permute(2, 0, 1, 3).contiguous().view(-1, batch_size, self.embed_dim)
+
+        # Final linear transformation
+        attn_output = self.to_out(attn_output)
+
+        return (attn_output, 0)

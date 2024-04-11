@@ -396,7 +396,7 @@ def setup_ui(addnet_paste_params):
     """
     can_edit = False
 
-    with gr.Row(equal_height=True):
+    with gr.Row(equal_height=False):
         # Lefthand column
         with gr.Column(variant="panel"):
             # Module and model selector
